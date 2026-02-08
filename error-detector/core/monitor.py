@@ -14,6 +14,7 @@ sys.path.insert(0, str(BASE_DIR))
 from core.error_analyzer import ErrorAnalyzer
 from core.notifier import DiscordNotifier
 from core.state import StateManager
+from core.submitter import _substitute_slurm_vars
 
 TERMINAL_STATES = {
     "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
@@ -36,7 +37,8 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def daemonize_and_monitor(job_id: str, error_file: str, output_file: str):
+def daemonize_and_monitor(job_id: str, error_file: str, output_file: str,
+                          job_name: str = "", is_array: bool = False):
     """Double-fork to create a daemon process that monitors the job."""
     state = StateManager(job_id)
 
@@ -78,20 +80,24 @@ def daemonize_and_monitor(job_id: str, error_file: str, output_file: str):
     os.dup2(fd, 2)  # stderr
     os.close(fd)
 
+    # Line-buffered so crash output is not lost
+    sys.stdout = os.fdopen(1, "w", buffering=1)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
+
     # Close stdin
     devnull = os.open(os.devnull, os.O_RDONLY)
     os.dup2(devnull, 0)
     os.close(devnull)
 
     # Initialize state
-    state.initialize(grandchild_pid, error_file, output_file)
+    state.initialize(grandchild_pid, error_file, output_file, job_name=job_name, is_array=is_array)
 
     print(f"[jobmon] Daemon started for job {job_id} (PID {grandchild_pid})")
     print(f"[jobmon] Error file: {error_file}")
     print(f"[jobmon] Output file: {output_file}")
 
     try:
-        _monitor_loop(job_id, error_file, output_file, state)
+        _monitor_loop(job_id, error_file, output_file, state, job_name, is_array)
     except Exception as e:
         print(f"[jobmon] Monitor crashed: {e}", file=sys.stderr)
         import traceback
@@ -116,7 +122,8 @@ def daemonize_and_monitor(job_id: str, error_file: str, output_file: str):
         os._exit(0)
 
 
-def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateManager):
+def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateManager,
+                  job_name: str = "", is_array: bool = False):
     """Main polling loop."""
     heartbeat_counter = 0
 
@@ -126,9 +133,10 @@ def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateMa
         if status is None:
             # Job no longer in queue — get final state from sacct
             print(f"[jobmon] Job {job_id} left the queue, querying sacct...")
-            final = _check_sacct_with_retry(job_id)
-            print(f"[jobmon] Final state: {final}")
-            _handle_termination(job_id, final, error_file, output_file, state)
+            sacct_results = _check_sacct_all_with_retry(job_id)
+            print(f"[jobmon] Final state(s): {sacct_results}")
+            _handle_termination(job_id, sacct_results, error_file, output_file, state,
+                               job_name, is_array)
             return
 
         # Update heartbeat periodically
@@ -142,31 +150,48 @@ def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateMa
 
 
 def _check_squeue(job_id: str) -> str | None:
-    """Check if job is still in the queue. Returns state string or None."""
+    """Check if job is still in the queue. Returns state string or None.
+    For array jobs, summarizes multi-line output (RUNNING if any task running, etc.).
+    """
     try:
         result = subprocess.run(
             ["squeue", "-j", job_id, "-h", "-o", "%T"],
             capture_output=True, text=True, timeout=30,
         )
         output = result.stdout.strip()
-        return output if output else None
+        if not output:
+            return None
+        lines = [l.strip() for l in output.splitlines() if l.strip()]
+        if not lines:
+            return None
+        if any(s == "RUNNING" for s in lines):
+            return "RUNNING"
+        if any(s == "COMPLETING" for s in lines):
+            return "RUNNING"
+        if all(s == "PENDING" for s in lines):
+            return "PENDING"
+        return lines[0]
     except subprocess.TimeoutExpired:
         return "UNKNOWN"  # Assume still running if squeue hangs
 
 
-def _check_sacct_with_retry(job_id: str) -> dict:
-    """Query sacct with retries (data may not be immediately available)."""
+def _check_sacct_all_with_retry(job_id: str) -> list:
+    """Query sacct with retries. Returns list of dicts (one per sub-task or single for non-array)."""
+    unknown_fallback = [{"job_id": job_id, "state": "UNKNOWN", "exit_code": "N/A",
+                         "elapsed": "N/A", "max_rss": "N/A", "job_name": "N/A"}]
     for attempt in range(SACCT_RETRY_COUNT):
-        result = _check_sacct(job_id)
-        if result.get("state") != "UNKNOWN":
-            return result
+        results = _check_sacct_all(job_id)
+        if not results:
+            results = unknown_fallback
+        if results[0].get("state") != "UNKNOWN":
+            return results
         print(f"[jobmon] sacct returned no data, retry {attempt + 1}/{SACCT_RETRY_COUNT}...")
         time.sleep(SACCT_RETRY_DELAY)
-    return result  # Return whatever we got
+    return results
 
 
-def _check_sacct(job_id: str) -> dict:
-    """Query sacct for final job state."""
+def _check_sacct_all(job_id: str) -> list:
+    """Query sacct for final job state(s). Returns list of dicts (one per sub-task or single)."""
     try:
         result = subprocess.run(
             ["sacct", "-j", job_id, "--parsable2", "--noheader",
@@ -174,54 +199,130 @@ def _check_sacct(job_id: str) -> dict:
             capture_output=True, text=True, timeout=30,
         )
     except subprocess.TimeoutExpired:
-        return {"job_id": job_id, "state": "UNKNOWN", "exit_code": "N/A",
-                "elapsed": "N/A", "max_rss": "N/A", "job_name": "N/A"}
+        return [{"job_id": job_id, "state": "UNKNOWN", "exit_code": "N/A",
+                 "elapsed": "N/A", "max_rss": "N/A", "job_name": "N/A"}]
 
+    results = []
     for line in result.stdout.strip().split("\n"):
         if not line.strip():
             continue
         fields = line.split("|")
         if len(fields) < 6:
             continue
-        # Match the base job ID (not <jobid>.batch or <jobid>.0)
-        if fields[0] == job_id:
-            return {
-                "job_id": fields[0],
+        fid = fields[0]
+        # Match base job ID (non-array) or sub-task IDs (e.g. 59482853_0); exclude .batch / .extern
+        if fid == job_id or (fid.startswith(job_id + "_") and "." not in fid):
+            results.append({
+                "job_id": fid,
                 "state": fields[1],
                 "exit_code": fields[2],
                 "elapsed": fields[3],
                 "max_rss": fields[4],
                 "job_name": fields[5],
-            }
+            })
 
-    return {"job_id": job_id, "state": "UNKNOWN", "exit_code": "N/A",
-            "elapsed": "N/A", "max_rss": "N/A", "job_name": "N/A"}
+    if not results:
+        return [{"job_id": job_id, "state": "UNKNOWN", "exit_code": "N/A",
+                "elapsed": "N/A", "max_rss": "N/A", "job_name": "N/A"}]
+    # If sacct returned both base job and sub-task rows (array job), keep only sub-tasks
+    # to avoid analyzing a template path and sending a spurious notification for the base row
+    sub_task_entries = [r for r in results if "_" in r["job_id"]]
+    if sub_task_entries:
+        return sub_task_entries
+    return results
 
 
-def _handle_termination(job_id: str, sacct_info: dict, error_file: str,
-                         output_file: str, state: StateManager):
-    """Analyze error file and send notification."""
+def _handle_termination(job_id: str, sacct_results: list, error_file: str,
+                       output_file: str, state: StateManager,
+                       job_name: str = "", is_array: bool = False):
+    """Analyze error file(s) and send notification(s). Array jobs: one notification per failed
+    sub-task, one success summary if all succeeded. CANCELLED (per task or whole job) skips notification.
+    """
     config = load_config()
-
-    # Wait a bit for error file to be flushed
-    time.sleep(5)
-
-    # Analyze error file
     patterns_file = BASE_DIR / "patterns" / "error_patterns.json"
     analyzer = ErrorAnalyzer(str(patterns_file))
-    analysis = analyzer.analyze(error_file)
-
-    print(f"[jobmon] Analysis: has_errors={analysis['has_errors']}, "
-          f"patterns={analysis['matched_patterns']}")
-
-    # Send notification
     notifier = DiscordNotifier(
         config["discord"]["success_webhook"],
         config["discord"]["error_webhook"],
     )
-    success = notifier.notify(job_id, sacct_info, analysis)
-    print(f"[jobmon] Discord notification sent: {success}")
 
-    # Update state
-    state.mark_complete(sacct_info.get("state", "UNKNOWN"))
-    print(f"[jobmon] Monitoring complete for job {job_id}")
+    # Wait a bit for error files to be flushed
+    time.sleep(5)
+
+    if not sacct_results:
+        state.mark_complete("UNKNOWN")
+        print(f"[jobmon] Monitoring complete for job {job_id} (no sacct results)")
+        return
+
+    # Single result: non-array job
+    if len(sacct_results) == 1:
+        sacct_info = sacct_results[0]
+        state_str = sacct_info.get("state", "")
+        if state_str.startswith("CANCELLED"):
+            print(f"[jobmon] Job {job_id} was cancelled — skipping notification")
+            state.mark_complete("CANCELLED")
+            return
+        analysis = analyzer.analyze(error_file)
+        print(f"[jobmon] Analysis: has_errors={analysis['has_errors']}, "
+              f"patterns={analysis['matched_patterns']}")
+        success = notifier.notify(job_id, sacct_info, analysis)
+        print(f"[jobmon] Discord notification sent: {success}")
+        state.mark_complete(state_str)
+        print(f"[jobmon] Monitoring complete for job {job_id}")
+        return
+
+    # Multiple results: array job
+    base_id = job_id
+    total = len(sacct_results)
+    completed_count = 0
+    cancelled_count = 0
+    all_success = True
+    for sacct_info in sacct_results:
+        sub_id = sacct_info.get("job_id", "")
+        state_str = sacct_info.get("state", "")
+        if state_str.startswith("CANCELLED"):
+            cancelled_count += 1
+            continue
+        if state_str.startswith("COMPLETED") and sacct_info.get("exit_code", "") == "0:0":
+            completed_count += 1
+            continue
+        all_success = False
+        # Resolve error file path for this sub-task
+        array_task_id = sub_id.split("_", 1)[1] if "_" in sub_id else None
+        if array_task_id is not None:
+            err_path = _substitute_slurm_vars(error_file, base_id, job_name,
+                                              array_task_id=array_task_id, is_array=True)
+        else:
+            err_path = error_file
+        analysis = analyzer.analyze(err_path)
+        print(f"[jobmon] Sub-task {sub_id} Analysis: has_errors={analysis['has_errors']}, "
+              f"patterns={analysis['matched_patterns']}")
+        array_info = {"task_id": sub_id, "task_index": array_task_id, "total_tasks": total}
+        success = notifier.notify(sub_id, sacct_info, analysis, array_info=array_info)
+        print(f"[jobmon] Discord notification sent for {sub_id}: {success}")
+
+    # All cancelled: skip notification (do not send false "COMPLETED" summary)
+    if cancelled_count == total:
+        print(f"[jobmon] Job {base_id} array: all {total} tasks cancelled — skipping notification")
+        state.mark_complete("CANCELLED")
+        print(f"[jobmon] Monitoring complete for job {base_id}")
+        return
+
+    if all_success and completed_count > 0:
+        # One green summary notification (at least one task completed, none failed)
+        summary_info = {
+            "job_id": base_id,
+            "state": "COMPLETED",
+            "exit_code": "0:0",
+            "elapsed": "N/A",
+            "max_rss": "N/A",
+            "job_name": job_name,
+        }
+        summary_analysis = {"has_errors": False, "matched_patterns": [], "error_summary": ""}
+        array_info = {"total_tasks": total, "all_success": True}
+        notifier.notify(base_id, summary_info, summary_analysis, array_info=array_info)
+        print(f"[jobmon] Discord success summary sent for array {base_id} ({completed_count}/{total} tasks)")
+
+    aggregate = "COMPLETED" if all_success else "MIXED"
+    state.mark_complete(aggregate)
+    print(f"[jobmon] Monitoring complete for job {base_id}")

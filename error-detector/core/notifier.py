@@ -10,14 +10,14 @@ class DiscordNotifier:
         self.success_webhook = success_webhook
         self.error_webhook = error_webhook
 
-    def notify(self, job_id: str, sacct_info: dict, analysis: dict):
+    def notify(self, job_id: str, sacct_info: dict, analysis: dict, array_info: dict | None = None):
         """Send job completion notification to the appropriate Discord channel."""
         is_success = (
             sacct_info.get("state", "").startswith("COMPLETED")
             and sacct_info.get("exit_code", "") == "0:0"
         )
         webhook = self.success_webhook if is_success else self.error_webhook
-        payload = self._build_payload(job_id, sacct_info, analysis, is_success)
+        payload = self._build_payload(job_id, sacct_info, analysis, is_success, array_info)
 
         for attempt in range(3):
             try:
@@ -32,10 +32,15 @@ class DiscordNotifier:
                     return False
         return False
 
-    def _build_payload(self, job_id: str, sacct_info: dict, analysis: dict, is_success: bool) -> dict:
+    def _build_payload(self, job_id: str, sacct_info: dict, analysis: dict, is_success: bool,
+                      array_info: dict | None = None) -> dict:
         if is_success:
             color = 0x2ECC71  # green
-            title = f"\u2705 Job `{job_id}` COMPLETED"
+            if array_info and array_info.get("all_success") and array_info.get("total_tasks"):
+                n = array_info["total_tasks"]
+                title = f"\u2705 Job `{job_id}` COMPLETED ({n}/{n} tasks)"
+            else:
+                title = f"\u2705 Job `{job_id}` COMPLETED"
         else:
             color = 0xE74C3C  # red
             state = sacct_info.get("state", "UNKNOWN")
@@ -49,6 +54,15 @@ class DiscordNotifier:
             {"name": "Job Name", "value": sacct_info.get("job_name", "N/A"), "inline": True},
             {"name": "Max RSS", "value": sacct_info.get("max_rss", "N/A") or "N/A", "inline": True},
         ]
+        if array_info:
+            task_idx = array_info.get("task_index") or array_info.get("task_id", "")
+            total = array_info.get("total_tasks", "")
+            if total and (task_idx or not array_info.get("all_success")):
+                fields.append({
+                    "name": "Array Task",
+                    "value": f"{task_idx} of {total}" if task_idx else f"{total} tasks",
+                    "inline": True,
+                })
 
         if not is_success and analysis.get("has_errors"):
             fields.append({

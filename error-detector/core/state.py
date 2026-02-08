@@ -14,12 +14,15 @@ class StateManager:
         self.path = STATE_DIR / f"{job_id}.json"
         STATE_DIR.mkdir(exist_ok=True)
 
-    def initialize(self, pid: int, error_file: str, output_file: str):
+    def initialize(self, pid: int, error_file: str, output_file: str,
+                   job_name: str = "", is_array: bool = False):
         data = {
             "job_id": self.job_id,
             "monitor_pid": pid,
             "error_file": error_file,
             "output_file": output_file,
+            "job_name": job_name,
+            "is_array": is_array,
             "started_at": time.time(),
             "heartbeat": time.time(),
             "status": "monitoring",

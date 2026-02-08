@@ -38,7 +38,7 @@ def cmd_submit(args):
     print(f"[jobmon] Submitting: sbatch {' '.join(sbatch_args)}")
 
     try:
-        job_id, error_file, output_file, working_dir = submit_job(sbatch_args)
+        job_id, error_file, output_file, working_dir, job_name, is_array = submit_job(sbatch_args)
     except RuntimeError as e:
         print(f"[jobmon] Submit failed: {e}")
         sys.exit(1)
@@ -48,7 +48,7 @@ def cmd_submit(args):
     print(f"[jobmon] Output file: {output_file}")
     print(f"[jobmon] Starting background monitor...")
 
-    daemonize_and_monitor(job_id, error_file, output_file)
+    daemonize_and_monitor(job_id, error_file, output_file, job_name=job_name, is_array=is_array)
 
     # Give daemon time to start
     time.sleep(1)
@@ -76,7 +76,7 @@ def cmd_watch(args):
 
     print(f"[jobmon] Starting monitor for job {job_id}...")
 
-    daemonize_and_monitor(job_id, error_file, output_file)
+    daemonize_and_monitor(job_id, error_file, output_file, job_name="", is_array=False)
 
     time.sleep(1)
     print(f"[jobmon] Monitor running in background. Check with: jobmon status")
@@ -147,6 +147,8 @@ def cmd_recover(args):
         job_id = data["job_id"]
         error_file = data.get("error_file", "")
         output_file = data.get("output_file", "")
+        job_name = data.get("job_name", "")
+        is_array = data.get("is_array", False)
 
         # Check if the SLURM job is still active
         result = subprocess.run(
@@ -158,14 +160,14 @@ def cmd_recover(args):
         if not slurm_status:
             print(f"[jobmon] Job {job_id}: SLURM job already finished, running final check...")
             # Job is done but monitor died before completing — run inline
-            from core.monitor import _check_sacct_with_retry, _handle_termination
-            final = _check_sacct_with_retry(job_id)
+            from core.monitor import _check_sacct_all_with_retry, _handle_termination
+            sacct_results = _check_sacct_all_with_retry(job_id)
             sm = StateManager(job_id)
-            _handle_termination(job_id, final, error_file, output_file, sm)
+            _handle_termination(job_id, sacct_results, error_file, output_file, sm, job_name, is_array)
             print(f"[jobmon] Job {job_id}: recovery complete")
         else:
             print(f"[jobmon] Job {job_id}: still {slurm_status}, restarting monitor...")
-            daemonize_and_monitor(job_id, error_file, output_file)
+            daemonize_and_monitor(job_id, error_file, output_file, job_name=job_name, is_array=is_array)
             time.sleep(1)
             print(f"[jobmon] Job {job_id}: monitor restarted")
 
