@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# jobmon - SLURM Job Monitor entry point
+# Resolves its own directory and dispatches to jobmon.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$SCRIPT_DIR/jobmon.py" "$@"

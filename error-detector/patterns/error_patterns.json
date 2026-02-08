@@ -1,0 +1,22 @@
+{
+  "patterns": [
+    {"name": "Python Traceback", "regex": "^Traceback \\(most recent call last\\)", "severity": "high"},
+    {"name": "CUDA Out of Memory", "regex": "CUDA out of memory|torch\\.cuda\\.OutOfMemoryError", "severity": "high"},
+    {"name": "SLURM OOM Kill", "regex": "oom-kill event|Out Of Memory|Exceeded job memory limit", "severity": "high"},
+    {"name": "Segmentation Fault", "regex": "Segmentation fault|SIGSEGV|segfault", "severity": "high"},
+    {"name": "NCCL Error", "regex": "NCCL error|NCCL_ERROR|ncclSystemError|ncclInternalError", "severity": "high"},
+    {"name": "CUDA Error", "regex": "CUDA error|cudaError|RuntimeError:.*CUDA", "severity": "high"},
+    {"name": "Python ImportError", "regex": "ImportError:|ModuleNotFoundError:", "severity": "medium"},
+    {"name": "Python RuntimeError", "regex": "RuntimeError:", "severity": "medium"},
+    {"name": "Permission Denied", "regex": "Permission denied|EACCES", "severity": "medium"},
+    {"name": "Disk Quota Exceeded", "regex": "Disk quota exceeded|No space left on device", "severity": "high"},
+    {"name": "File Not Found", "regex": "FileNotFoundError:|No such file or directory", "severity": "medium"},
+    {"name": "Timeout / Hang", "regex": "TimeoutError|SIGTERM|DUE TO TIME LIMIT|timed out", "severity": "high"},
+    {"name": "Bus Error", "regex": "Bus error|SIGBUS", "severity": "high"},
+    {"name": "Killed Signal", "regex": "^Killed$|signal 9|SIGKILL", "severity": "high"},
+    {"name": "Assertion Error", "regex": "AssertionError:", "severity": "medium"},
+    {"name": "NCCL Timeout", "regex": "Watchdog caught collective operation timeout|ProcessGroupNCCL.*timeout", "severity": "high"},
+    {"name": "Distributed Error", "regex": "torch\\.distributed.*error|RendezvousError|c10d::.*Error", "severity": "high"},
+    {"name": "Memory Error", "regex": "MemoryError|std::bad_alloc", "severity": "high"}
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "discord": {
+    "success_webhook": "https://discord.com/api/webhooks/YOUR_SUCCESS_WEBHOOK_ID/YOUR_SUCCESS_WEBHOOK_TOKEN",
+    "error_webhook": "https://discord.com/api/webhooks/YOUR_ERROR_WEBHOOK_ID/YOUR_ERROR_WEBHOOK_TOKEN"
+  },
+  "monitor": {
+    "poll_interval_running": 30,
+    "poll_interval_pending": 60,
+    "sacct_retry_count": 5,
+    "sacct_retry_delay": 10,
+    "max_error_lines": 500
+  }
+}
