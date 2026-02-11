@@ -126,6 +126,8 @@ def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateMa
                   job_name: str = "", is_array: bool = False):
     """Main polling loop."""
     heartbeat_counter = 0
+    # Track which array sub-tasks have already been reported as failed
+    reported_failures = set()
 
     while True:
         status = _check_squeue(job_id)
@@ -136,8 +138,14 @@ def _monitor_loop(job_id: str, error_file: str, output_file: str, state: StateMa
             sacct_results = _check_sacct_all_with_retry(job_id)
             print(f"[jobmon] Final state(s): {sacct_results}")
             _handle_termination(job_id, sacct_results, error_file, output_file, state,
-                               job_name, is_array)
+                               job_name, is_array,
+                               already_reported=reported_failures)
             return
+
+        # For array jobs that are running, check sacct for early failures
+        if is_array and status == "RUNNING":
+            reported_failures = _check_early_array_failures(
+                job_id, error_file, job_name, reported_failures)
 
         # Update heartbeat periodically
         heartbeat_counter += 1
@@ -232,12 +240,79 @@ def _check_sacct_all(job_id: str) -> list:
     return results
 
 
+def _check_early_array_failures(job_id: str, error_file: str, job_name: str,
+                                reported_failures: set) -> set:
+    """Check sacct for any array sub-tasks that have already failed while the array is still running.
+    Sends immediate Discord notifications for newly failed tasks. Returns updated set of reported IDs.
+    """
+    results = _check_sacct_all(job_id)
+    if not results:
+        return reported_failures
+
+    # Only look at sub-task rows (contain '_')
+    sub_tasks = [r for r in results if "_" in r["job_id"]]
+    if not sub_tasks:
+        return reported_failures
+
+    new_failures = []
+    for sacct_info in sub_tasks:
+        sub_id = sacct_info["job_id"]
+        state_str = sacct_info.get("state", "")
+        exit_code = sacct_info.get("exit_code", "")
+        # Skip if already reported, not in a terminal state, or is a success/cancel
+        if sub_id in reported_failures:
+            continue
+        if state_str not in TERMINAL_STATES:
+            continue
+        if state_str.startswith("CANCELLED"):
+            continue
+        if state_str == "COMPLETED" and exit_code == "0:0":
+            continue
+        # This is a new failure
+        new_failures.append(sacct_info)
+
+    if not new_failures:
+        return reported_failures
+
+    # Send notifications for new failures
+    config = load_config()
+    patterns_file = BASE_DIR / "patterns" / "error_patterns.json"
+    analyzer = ErrorAnalyzer(str(patterns_file))
+    notifier = DiscordNotifier(
+        config["discord"]["success_webhook"],
+        config["discord"]["error_webhook"],
+    )
+    time.sleep(3)  # Brief wait for error files to flush
+
+    total = len(sub_tasks)
+    for sacct_info in new_failures:
+        sub_id = sacct_info["job_id"]
+        array_task_id = sub_id.split("_", 1)[1] if "_" in sub_id else None
+        if array_task_id is not None:
+            err_path = _substitute_slurm_vars(error_file, job_id, job_name,
+                                              array_task_id=array_task_id, is_array=True)
+        else:
+            err_path = error_file
+        analysis = analyzer.analyze(err_path)
+        print(f"[jobmon] Early failure detected: {sub_id} state={sacct_info['state']}")
+        array_info = {"task_id": sub_id, "task_index": array_task_id, "total_tasks": total}
+        success = notifier.notify(sub_id, sacct_info, analysis, array_info=array_info)
+        print(f"[jobmon] Early failure notification sent for {sub_id}: {success}")
+        reported_failures.add(sub_id)
+
+    return reported_failures
+
+
 def _handle_termination(job_id: str, sacct_results: list, error_file: str,
                        output_file: str, state: StateManager,
-                       job_name: str = "", is_array: bool = False):
+                       job_name: str = "", is_array: bool = False,
+                       already_reported: set = None):
     """Analyze error file(s) and send notification(s). Array jobs: one notification per failed
     sub-task, one success summary if all succeeded. CANCELLED (per task or whole job) skips notification.
+    Sub-tasks in already_reported are skipped (already notified during early failure detection).
     """
+    if already_reported is None:
+        already_reported = set()
     config = load_config()
     patterns_file = BASE_DIR / "patterns" / "error_patterns.json"
     analyzer = ErrorAnalyzer(str(patterns_file))
@@ -287,6 +362,10 @@ def _handle_termination(job_id: str, sacct_results: list, error_file: str,
             completed_count += 1
             continue
         all_success = False
+        # Skip if already reported during early failure detection
+        if sub_id in already_reported:
+            print(f"[jobmon] Sub-task {sub_id} already reported — skipping")
+            continue
         # Resolve error file path for this sub-task
         array_task_id = sub_id.split("_", 1)[1] if "_" in sub_id else None
         if array_task_id is not None:
