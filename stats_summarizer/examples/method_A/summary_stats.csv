@@ -1,0 +1,5 @@
+metric,value
+ARI,0.82
+NMI,0.79
+ASW_label,0.55
+Batch_ASW,0.72

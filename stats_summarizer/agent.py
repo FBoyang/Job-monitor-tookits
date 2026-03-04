@@ -3,6 +3,9 @@ Agentic orchestrator using OpenAI function calling.
 
 The agent iteratively reads summary statistics files, compares metrics
 across methods, and generates structured comparison reports.
+
+Supports both direct OpenAI and Azure OpenAI (HMS).
+Handles reasoning models (gpt-5, o1, o3) which do not accept temperature.
 """
 
 import json
@@ -44,30 +47,69 @@ Guidelines:
 
     def __init__(self, config: Config):
         self.config = config
+
         if config.use_azure:
             self.client = AzureOpenAI(
                 api_key=config.azure_api_key,
                 azure_endpoint=config.azure_endpoint,
                 api_version=config.azure_api_version,
             )
+            self.model = config.azure_deployment  # e.g. "gpt-5"
+            logger.info(
+                f"Using Azure OpenAI: {config.azure_endpoint} / {self.model}"
+            )
         else:
             self.client = OpenAI(api_key=config.openai_api_key)
-        self.model = config.openai_model
+            self.model = config.openai_model
+            logger.info(f"Using OpenAI: {self.model}")
+
+        self.is_reasoning = config.is_reasoning_model
         self.max_steps = config.max_agent_steps
         self.messages: list[dict[str, Any]] = []
         self._step_count = 0
 
+    def _build_create_kwargs(self, *, force_answer: bool = False) -> dict:
+        """
+        Build kwargs for chat.completions.create(), handling differences
+        between reasoning models (gpt-5, o-series) and standard models.
+        """
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self.messages,
+        }
+
+        if not force_answer:
+            kwargs["tools"] = TOOL_DEFINITIONS
+            kwargs["tool_choice"] = "auto"
+
+        if self.is_reasoning:
+            # Reasoning models do not accept temperature parameter
+            pass
+        else:
+            kwargs["temperature"] = self.config.temperature
+
+        return kwargs
+
     def _init_messages(self, user_query: str, data_paths: list[str]) -> None:
         """Initialize the conversation with system prompt and user query."""
         path_info = "\n".join(f"  - {p}" for p in data_paths)
-        system_msg = (
+
+        system_content = (
             f"{self.SYSTEM_PROMPT}\n\n"
             f"Available data paths to search:\n{path_info}"
         )
-        self.messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_query},
-        ]
+
+        if self.is_reasoning:
+            # Reasoning models (gpt-5, o1, o3): use "developer" role
+            self.messages = [
+                {"role": "developer", "content": system_content},
+                {"role": "user", "content": user_query},
+            ]
+        else:
+            self.messages = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_query},
+            ]
 
     def run(
         self,
@@ -96,13 +138,8 @@ Guidelines:
             self._step_count += 1
             logger.info(f"Agent step {self._step_count}/{self.max_steps}")
 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=TOOL_DEFINITIONS,
-                tool_choice="auto",
-                temperature=self.config.temperature,
-            )
+            kwargs = self._build_create_kwargs()
+            response = self.client.chat.completions.create(**kwargs)
 
             choice = response.choices[0]
             message = choice.message
@@ -126,6 +163,7 @@ Guidelines:
                     result = execute_tool(fn_name, fn_args)
                 except Exception as e:
                     result = f"Error executing {fn_name}: {e}"
+                    logger.error(result)
 
                 self.messages.append({
                     "role": "tool",
@@ -137,6 +175,7 @@ Guidelines:
 
     def _force_final_answer(self) -> str:
         """Force the agent to produce a final answer if max steps reached."""
+        logger.warning("Max steps reached, forcing final answer")
         self.messages.append({
             "role": "user",
             "content": (
@@ -145,9 +184,6 @@ Guidelines:
                 "a final comparison report with markdown tables."
             ),
         })
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=self.messages,
-            temperature=self.config.temperature,
-        )
+        kwargs = self._build_create_kwargs(force_answer=True)
+        response = self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""

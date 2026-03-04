@@ -1,6 +1,6 @@
 # stats_summarizer
 
-An **agentic framework** for comparing cell evaluation summary statistics across different methods. Powered by OpenAI function-calling, the agent autonomously discovers, reads, and compares metrics from summary statistics files, producing comprehensive comparison reports.
+An **agentic framework** for comparing cell evaluation summary statistics across different methods. Powered by OpenAI function-calling (via HMS Azure OpenAI), the agent autonomously discovers, reads, and compares metrics from summary statistics files, producing comprehensive comparison reports.
 
 ---
 
@@ -38,11 +38,11 @@ The agent uses OpenAI function-calling to plan and execute these steps autonomou
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌────────────────┐
-│   main.py   │────>│   agent.py   │────>│  OpenAI API    │
-│  (CLI)      │     │ (agentic     │     │  (gpt-4o with  │
-│             │     │  loop)       │<────│  tool calling) │
-└─────────────┘     └──────┬───────┘     └────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌────────────────────┐
+│   main.py   │────>│   agent.py   │────>│  Azure OpenAI      │
+│  (CLI)      │     │ (agentic     │     │  (gpt-5 with       │
+│             │     │  loop)       │<────│  function calling)  │
+└─────────────┘     └──────┬───────┘     └────────────────────┘
                            │
                     ┌──────┴───────┐
                     │   tools.py   │
@@ -58,7 +58,7 @@ The agent uses OpenAI function-calling to plan and execute these steps autonomou
         └──────────┘ └──────────┘ └──────────┘
 ```
 
-**Agent loop**: The agent receives a query, calls tools iteratively (list files → read stats → compare → generate table), and returns a final markdown report. It self-terminates when satisfied or after `max_steps`.
+**Agent loop**: The agent receives a query, calls tools iteratively (list files -> read stats -> compare -> generate table), and returns a final markdown report. It self-terminates when satisfied or after `max_steps`.
 
 ---
 
@@ -67,18 +67,20 @@ The agent uses OpenAI function-calling to plan and execute these steps autonomou
 ### Prerequisites
 
 - Python 3.10+
-- An OpenAI API key or Azure OpenAI credentials
+- HMS Azure OpenAI API key (get from https://hu.sharepoint.com/sites/azureai)
 
 ### Installation
 
 ```bash
-cd /path/to/stats_summarizer
+cd /n/home12/bof695/holylfs06/Users/bof695/auxiliary/Job-monitor-tookits/stats_summarizer
 
-# Create a virtual environment (recommended)
+# Option A: use an existing conda env with openai installed
+conda activate borzoi_env
+pip install openai>=1.0.0
+
+# Option B: create a virtual environment
 python -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -86,51 +88,41 @@ pip install -r requirements.txt
 
 ## API Key Management
 
-**API keys are NEVER stored in this directory.** They are loaded exclusively from environment variables.
+**The API key is NEVER stored in this directory.** It is loaded exclusively from environment variables.
 
-### Option 1: OpenAI (standard)
+### HMS Azure OpenAI setup (recommended)
+
+Add these to your `~/.bashrc`:
 
 ```bash
-# Add to ~/.bashrc or ~/.bash_profile
-export OPENAI_API_KEY=sk-your-openai-key-here
+# HMS Azure OpenAI
+export AZURE_OPENAI_API_KEY="your-32-character-key"
+export AZURE_OPENAI_ENDPOINT="https://azure-ai.hms.edu"
+```
+
+Then reload:
+
+```bash
 source ~/.bashrc
 ```
 
-### Option 2: Azure OpenAI (e.g. HMS azure-ai.hms.edu)
+> **IMPORTANT**: Use the **production** endpoint `https://azure-ai.hms.edu` (NOT `azure-ai-dev.hms.edu`).
+> The dev endpoint is blocked by WAF from cluster IPs.
 
-Azure uses the `api-key` header. Set both variables:
+### Available HMS Azure deployments
 
-```bash
-export AZURE_OPENAI_API_KEY=your-azure-key-here
-export AZURE_OPENAI_ENDPOINT=https://your-endpoint.example.com
-```
+| Deployment | Description |
+|---|---|
+| `gpt-5` | Most capable (default) |
+| `gpt-5-mini` | Faster and cheaper |
 
-For Azure, use `--model` to specify your deployment name (e.g. `gpt-5`):
+See the [HMS Azure AI Model Catalog](https://hu.sharepoint.com/sites/azureai) for the latest.
 
-```bash
-python main.py --paths /path/to/results --model gpt-5 --output report.md
-```
-
-### Option 3: Set per-session
+### Alternative: direct OpenAI
 
 ```bash
-# OpenAI
-export OPENAI_API_KEY="sk-your-key-here"
-python main.py --paths /path/to/results
-
-# Azure
-export AZURE_OPENAI_API_KEY="your-key" AZURE_OPENAI_ENDPOINT="https://..."
-python main.py --paths /path/to/results --model gpt-5
-```
-
-### Option 4: SLURM job script
-
-```bash
-#\!/bin/bash
-#SBATCH --job-name=stats_summarizer
-#SBATCH ...
-export OPENAI_API_KEY="sk-your-key-here"   # or AZURE_OPENAI_* for Azure
-python main.py --paths /path/to/results --output report.md
+export OPENAI_API_KEY="sk-..."
+python main.py --paths /data/results --model gpt-4o
 ```
 
 ### Verify no secrets are leaked
@@ -139,7 +131,23 @@ python main.py --paths /path/to/results --output report.md
 python main.py --check-secrets
 ```
 
-This scans all project files for potential API key patterns (OpenAI `sk-` and Azure-style keys).
+### SLURM job script example
+
+```bash
+#\!/bin/bash
+#SBATCH --job-name=stats_summarizer
+#SBATCH --output=stats_%j.out
+#SBATCH --time=00:30:00
+#SBATCH --mem=4G
+#SBATCH --partition=gpu
+
+source ~/.bashrc          # loads AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT
+conda activate borzoi_env
+
+python /n/holylfs06/LABS/mzitnik_lab/Users/bof695/auxiliary/Job-monitor-tookits/stats_summarizer/main.py \
+    --paths /path/to/method1/results /path/to/method2/results \
+    --output comparison_report.md
+```
 
 ---
 
@@ -148,7 +156,7 @@ This scans all project files for potential API key patterns (OpenAI `sk-` and Az
 ### Basic usage
 
 ```bash
-# Compare methods across directories
+# Compare methods across directories (uses gpt-5 by default)
 python main.py --paths /path/to/method1/results /path/to/method2/results
 
 # Custom analysis query
@@ -158,7 +166,10 @@ python main.py --paths /path/to/results \
 # Save report to file
 python main.py --paths /path/to/results --output comparison_report.md
 
-# Verbose mode (shows agent reasoning)
+# Use gpt-5-mini for faster/cheaper runs
+python main.py --paths /path/to/results --model gpt-5-mini
+
+# Verbose mode (shows agent reasoning and tool calls)
 python main.py --paths /path/to/results --verbose
 ```
 
@@ -173,7 +184,7 @@ Create a `myconfig.json` (no API keys\!):
         "/n/holylfs06/path/to/Harmony/results",
         "/n/holylfs06/path/to/scanorama/results"
     ],
-    "openai_model": "gpt-4o",
+    "azure_deployment": "gpt-5",
     "max_agent_steps": 30,
     "output_dir": "outputs"
 }
@@ -191,7 +202,7 @@ python main.py --config myconfig.json
 | `--query` | `-q` | Natural language query for the agent |
 | `--config` | `-c` | Path to JSON config file |
 | `--output` | `-o` | Save report to this file |
-| `--model` | `-m` | Model or Azure deployment name (default: gpt-4o) |
+| `--model` | `-m` | Deployment name (default: gpt-5 for Azure) |
 | `--max-steps` | | Max agent iterations (default: 20) |
 | `--verbose` | `-v` | Enable debug logging |
 | `--check-secrets` | | Scan for leaked API keys |
@@ -207,7 +218,7 @@ python main.py --config myconfig.json
 | JSON | `.json` | Flat dict, nested with "metrics" key, or list |
 | Plain text | `.txt`, `.log` | Extracts `key: value` or `key = value` pairs |
 
-The agent can also use the `read_file_raw` tool to inspect unknown formats and adapt its parsing.
+The agent can also use the `read_file_raw` tool to inspect unknown formats and adapt its parsing strategy.
 
 ---
 
@@ -222,7 +233,7 @@ from typing import Any
 
 class MyReader(BaseReader):
     def read(self, file_path: str) -> dict[str, Any]:
-        # Parse your file format
+        # Parse your file format here
         metrics = {"ari": 0.85, "nmi": 0.72}
         return {
             "file_path": file_path,
@@ -244,25 +255,26 @@ READER_REGISTRY[".myext"] = MyReader
 
 ### Environment variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | Yes* | Your OpenAI API key |
-| `AZURE_OPENAI_API_KEY` | Yes* | Azure OpenAI API key (use with Azure) |
-| `AZURE_OPENAI_ENDPOINT` | Yes* | Azure endpoint URL (e.g. `https://azure-ai.hms.edu`) |
-| `AZURE_OPENAI_API_VERSION` | No | Azure API version (default: `2025-03-01-preview`) |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `AZURE_OPENAI_API_KEY` | Yes* | | HMS Azure API key (32-char) |
+| `AZURE_OPENAI_ENDPOINT` | No | `https://azure-ai.hms.edu` | Azure endpoint |
+| `AZURE_OPENAI_DEPLOYMENT` | No | `gpt-5` | Model deployment name |
+| `AZURE_OPENAI_API_VERSION` | No | `2025-03-01-preview` | API version |
+| `OPENAI_API_KEY` | Yes* | | Direct OpenAI key (alternative) |
 
-*Provide either `OPENAI_API_KEY` (for OpenAI) or both `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` (for Azure).
+*One of `AZURE_OPENAI_API_KEY` or `OPENAI_API_KEY` must be set.
 
-### Config file fields
+### Config file fields (JSON)
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `data_paths` | list[str] | `[]` | Directories to search |
-| `openai_model` | str | `"gpt-4o"` | Model for the agent |
+| `azure_deployment` | str | `"gpt-5"` | Azure model deployment |
+| `openai_model` | str | `"gpt-4o"` | Model (direct OpenAI only) |
 | `max_agent_steps` | int | `20` | Max tool-calling iterations |
-| `temperature` | float | `0.0` | LLM temperature |
+| `temperature` | float | `0.0` | LLM temperature (ignored for reasoning models) |
 | `output_dir` | str | `"outputs"` | Default output directory |
-| `verbose` | bool | `false` | Enable debug logging |
 
 ---
 
@@ -272,39 +284,42 @@ READER_REGISTRY[".myext"] = MyReader
 stats_summarizer/
 ├── main.py              # CLI entry point
 ├── agent.py             # OpenAI agentic orchestrator (function-calling loop)
-├── tools.py             # Tool definitions + dispatch registry
-├── config.py            # Configuration & env variable management
-├── comparator.py        # Metric comparison engine
-├── reporter.py          # Table/report generation (markdown, CSV)
+├── tools.py             # 5 tools: list_files, read_stats, compare_metrics,
+│                        #          generate_table, read_file_raw
+├── config.py            # Config, env variable management, secret scanner
+├── comparator.py        # Metric alignment + summary stats (mean/std/best/worst)
+├── reporter.py          # Markdown & CSV table generation
 ├── readers/
 │   ├── __init__.py      # Reader registry & auto-selection
-│   ├── base.py          # Abstract base reader
-│   ├── csv_reader.py    # CSV/TSV parser
-│   ├── json_reader.py   # JSON parser
-│   └── txt_reader.py    # Plain text key-value parser
+│   ├── base.py          # Abstract interface
+│   ├── csv_reader.py    # CSV/TSV (key-value & tabular)
+│   ├── json_reader.py   # JSON (flat, nested, list)
+│   └── txt_reader.py    # Plain text key=value extraction
 ├── examples/            # Example data files (for testing)
 ├── outputs/             # Generated reports (gitignored)
-├── requirements.txt
-├── .env.example         # Instructions for setting up API key
+├── requirements.txt     # openai>=1.0.0
+├── .env.example         # Env var setup instructions (no real keys)
 ├── .gitignore
 └── README.md
 ```
 
 ### Module responsibilities
 
-- **`main.py`**: Parses CLI args, loads config, runs the agent, saves output
-- **`agent.py`**: Implements the agentic loop — sends messages to OpenAI, processes tool calls, accumulates context, and produces a final report
-- **`tools.py`**: Defines the 5 tools the agent can call (list_files, read_stats, compare_metrics, generate_table, read_file_raw) with both OpenAI schemas and Python implementations
-- **`config.py`**: Loads API key from env, merges with optional config file, includes a secret-scanning utility
-- **`comparator.py`**: Pure Python metric comparison — aligns metrics across methods, computes summary stats (mean, std, best, worst)
-- **`reporter.py`**: Formats comparison data into markdown tables or CSV; handles file saving
-- **`readers/`**: Pluggable readers for different file formats, auto-selected by extension
+| Module | Role |
+|---|---|
+| `main.py` | Parses CLI args, loads config, runs agent, saves output |
+| `agent.py` | Agentic loop: sends messages to OpenAI, processes tool calls, produces report |
+| `tools.py` | Defines 5 agent tools with OpenAI schemas + Python implementations |
+| `config.py` | Loads API key from env only, merges optional config file, scans for secrets |
+| `comparator.py` | Aligns metrics across methods, computes mean/std/best/worst |
+| `reporter.py` | Formats comparison data into markdown or CSV tables |
+| `readers/` | Pluggable readers auto-selected by file extension |
 
 ---
 
 ## Examples
 
-### Example: comparing scRNA-seq integration methods
+### Comparing scRNA-seq integration methods
 
 ```bash
 python main.py \
@@ -318,21 +333,19 @@ python main.py \
 ```markdown
 ## Metric Comparison
 
-| Metric           | scVI     | Harmony  | scanorama | LIGER    | Best      |
-|------------------|----------|----------|-----------|----------|-----------|
-| ARI              | **0.82** | 0.75     | 0.71      | 0.68     | scVI      |
-| NMI              | **0.79** | 0.73     | 0.70      | 0.65     | scVI      |
-| ASW_label        | 0.55     | **0.61** | 0.52      | 0.48     | Harmony   |
-| Batch_ASW        | 0.72     | 0.68     | **0.75**  | 0.70     | scanorama |
-| iLISI            | 0.85     | 0.82     | **0.88**  | 0.80     | scanorama |
+| Metric      | scVI     | Harmony  | scanorama | LIGER    | Best      |
+|-------------|----------|----------|-----------|----------|-----------|
+| ARI         | **0.82** | 0.75     | 0.71      | 0.68     | scVI      |
+| NMI         | **0.79** | 0.73     | 0.70      | 0.65     | scVI      |
+| ASW_label   | 0.55     | **0.61** | 0.52      | 0.48     | Harmony   |
+| Batch_ASW   | 0.72     | 0.68     | **0.75**  | 0.70     | scanorama |
 
 ### Summary Statistics
 
-| Metric      | Mean   | Std    | Best   | Worst  |
-|-------------|--------|--------|--------|--------|
-| ARI         | 0.7400 | 0.0616 | 0.8200 | 0.6800 |
-| NMI         | 0.7175 | 0.0585 | 0.7900 | 0.6500 |
-| ...
+| Metric | Mean   | Std    | Best   | Worst  |
+|--------|--------|--------|--------|--------|
+| ARI    | 0.7400 | 0.0616 | 0.8200 | 0.6800 |
+| NMI    | 0.7175 | 0.0585 | 0.7900 | 0.6500 |
 ```
 
 ---
@@ -341,19 +354,19 @@ python main.py \
 
 ### Adding new agent tools
 
-1. Add the Python function in `tools.py`
-2. Add the OpenAI schema to `TOOL_DEFINITIONS`
+1. Write the Python function in `tools.py`
+2. Add the OpenAI function schema to `TOOL_DEFINITIONS`
 3. Register in `_TOOL_REGISTRY`
 
-### Customizing the agent behavior
+### Customizing agent behavior
 
-Edit `StatsAgent.SYSTEM_PROMPT` in `agent.py` to change how the agent approaches the analysis (e.g., prioritize certain metrics, change comparison style).
+Edit `StatsAgent.SYSTEM_PROMPT` in `agent.py` to change how the agent approaches analysis (e.g., prioritize certain metrics, change reporting style).
 
-### Using a different model
+### Switching models
 
 ```bash
-python main.py --paths /data/results --model gpt-4o-mini  # cheaper, faster
-python main.py --paths /data/results --model gpt-4-turbo  # more capable
+python main.py --paths /data/results --model gpt-5-mini   # faster/cheaper
+python main.py --paths /data/results --model gpt-5         # most capable (default)
 ```
 
 ---
@@ -362,8 +375,12 @@ python main.py --paths /data/results --model gpt-4-turbo  # more capable
 
 | Issue | Solution |
 |---|---|
-| `No API credentials found` | Set `OPENAI_API_KEY` or `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` |
+| `No API credentials found` | Set `AZURE_OPENAI_API_KEY` in `~/.bashrc` and `source ~/.bashrc` |
+| `503 Service Unavailable` / Incapsula | Use production endpoint: `export AZURE_OPENAI_ENDPOINT=https://azure-ai.hms.edu` (NOT `azure-ai-dev.hms.edu`) |
+| `Unsupported parameter: temperature` | gpt-5 is a reasoning model; the code auto-detects this and skips temperature |
+| `Unsupported parameter: max_tokens` | gpt-5 uses `max_completion_tokens`; the openai SDK handles this |
 | Agent loops without producing output | Increase `--max-steps` or simplify `--query` |
-| File format not recognized | Add a custom reader (see above) or use `--query` to instruct the agent |
+| File format not recognized | Add a custom reader (see above) or use `--query` to guide the agent |
 | Permission denied on data paths | Check file permissions with `ls -la` |
-| Rate limit errors | Use `gpt-4o-mini` or reduce `--max-steps` |
+| Rate limit errors | Use `gpt-5-mini` or reduce `--max-steps` |
+| Works on laptop but not cluster | Cluster may need production endpoint; dev endpoint is WAF-blocked |

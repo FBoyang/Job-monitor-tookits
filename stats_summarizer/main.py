@@ -3,7 +3,7 @@
 stats_summarizer - CLI entry point.
 
 An agentic framework for comparing cell evaluation summary statistics
-across different methods.
+across different methods using OpenAI / Azure OpenAI.
 
 Usage:
     python main.py --paths /path/to/method1 /path/to/method2
@@ -38,6 +38,9 @@ Examples:
 
   # Save output to file
   python main.py --paths /data/results --output report.md
+
+  # Use gpt-5-mini for faster/cheaper runs
+  python main.py --paths /data/results --model gpt-5-mini
         """,
     )
 
@@ -67,7 +70,7 @@ Examples:
     parser.add_argument(
         "--model", "-m",
         default=None,
-        help="OpenAI model to use (default: gpt-4o).",
+        help="Model/deployment name (default: gpt-5 for Azure, gpt-4o for OpenAI).",
     )
     parser.add_argument(
         "--max-steps",
@@ -119,15 +122,24 @@ Examples:
     if args.paths:
         config.data_paths = args.paths
     if args.model:
-        config.openai_model = args.model
+        if config.use_azure:
+            config.azure_deployment = args.model
+        else:
+            config.openai_model = args.model
     if args.max_steps:
         config.max_agent_steps = args.max_steps
     if args.verbose:
         config.verbose = True
 
     if not config.data_paths:
-        print("Error: No data paths provided. Use --paths or --config.", file=sys.stderr)
+        print("Error: No data paths provided. Use --paths or --config.",
+              file=sys.stderr)
         sys.exit(1)
+
+    # Print configuration summary
+    print("Configuration:")
+    config.print_status()
+    print()
 
     # Run the agent
     agent = StatsAgent(config)
