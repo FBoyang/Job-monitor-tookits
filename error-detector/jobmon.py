@@ -2,18 +2,22 @@
 """jobmon - SLURM Job Monitor with Discord Notifications.
 
 Usage:
-    jobmon submit <script.sbatch> [sbatch-args...]   Submit and auto-monitor
-    jobmon watch <jobid> [--error FILE] [--output FILE]  Monitor existing job
-    jobmon status                                     Show active monitors
-    jobmon cancel <jobid>                             Stop monitoring a job
-    jobmon recover                                    Restart dead monitors
-    jobmon test-discord                               Test webhook connectivity
+    jobmon submit <script.sbatch> [sbatch-args...]      Submit and auto-monitor
+    jobmon bash <script.sh> [args...]                   Run bash submitter and auto-watch child jobs
+    jobmon watch <jobid> [--error FILE] [--output FILE] Monitor existing job
+    jobmon status                                        Show active monitors
+    jobmon cancel <jobid>                                Stop monitoring a job
+    jobmon recover                                       Restart dead monitors
+    jobmon test-discord                                  Test webhook connectivity
 """
 
 import argparse
 import json
 import os
+import re
+import selectors
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,6 +29,78 @@ from core.submitter import submit_job
 from core.monitor import daemonize_and_monitor, load_config
 from core.notifier import DiscordNotifier
 from core.state import StateManager
+
+
+def _infer_job_metadata_from_scontrol(job_id: str) -> tuple[str, str, str, bool]:
+    """Infer stderr/stdout paths + name for an already-submitted job."""
+    default = os.path.join(os.getcwd(), f"slurm-{job_id}.out")
+    error_file = default
+    output_file = default
+    job_name = ""
+    is_array = False
+
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "job", "-o", job_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return error_file, output_file, job_name, is_array
+
+        line = result.stdout.strip().splitlines()[0]
+        fields = {}
+        for token in line.split():
+            if "=" in token:
+                k, v = token.split("=", 1)
+                fields[k] = v
+
+        job_name = fields.get("JobName", "")
+        stderr_raw = fields.get("StdErr")
+        stdout_raw = fields.get("StdOut")
+        array_spec = fields.get("ArrayTaskId", "")
+        is_array = bool(array_spec and array_spec != "N/A")
+
+        if stderr_raw:
+            error_file = stderr_raw
+        if stdout_raw:
+            output_file = stdout_raw
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return error_file, output_file, job_name, is_array
+
+
+def _notify_bash_failure(script_path: str, return_code: int, tail_lines: list[str]):
+    """Send an immediate Discord error notification for local bash failure."""
+    try:
+        config = load_config()
+        notifier = DiscordNotifier(
+            config["discord"]["success_webhook"],
+            config["discord"]["error_webhook"],
+        )
+        script_name = os.path.basename(script_path)
+        notifier.notify(
+            job_id=f"bash:{script_name}",
+            sacct_info={
+                "state": "BASH_FAILED",
+                "exit_code": f"{return_code}:0",
+                "elapsed": "N/A",
+                "job_name": script_name,
+                "max_rss": "N/A",
+            },
+            analysis={
+                "has_errors": True,
+                "error_summary": f"Local bash submitter failed: {script_path} (exit {return_code})",
+                "matched_patterns": ["bash submitter failure"],
+                "relevant_lines": tail_lines[-8:],
+                "tail": tail_lines[-20:],
+            },
+        )
+    except Exception as e:
+        print(f"[jobmon] Warning: failed to send bash failure notification: {e}")
 
 
 def cmd_submit(args):
@@ -54,6 +130,79 @@ def cmd_submit(args):
     time.sleep(1)
     print(f"[jobmon] Monitor running in background. Check with: jobmon status")
     print(f"[jobmon] Monitor log: {BASE_DIR / 'logs' / f'{job_id}.monitor.log'}")
+
+
+def cmd_bash(args):
+    """Run a local bash submitter script and auto-watch child sbatch jobs."""
+    script_path = args.script_path
+    script_args = args.script_args or []
+
+    if not os.path.isfile(script_path):
+        print(f"[jobmon] Error: script not found: {script_path}")
+        sys.exit(1)
+
+    cmd = ["bash", script_path] + script_args
+    print(f"[jobmon] Running local submitter: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    submitted_job_ids = []
+    seen_job_ids = set()
+    tail_lines = []
+    submit_re = re.compile(r"Submitted batch job (\d+)")
+
+    sel = selectors.DefaultSelector()
+    if proc.stdout:
+        sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+    if proc.stderr:
+        sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+    while sel.get_map():
+        for key, _ in sel.select(timeout=0.5):
+            stream = key.fileobj
+            line = stream.readline()
+            if line == "":
+                sel.unregister(stream)
+                continue
+
+            print(line, end="")
+            line_clean = line.rstrip("\n")
+            tail_lines.append(line_clean)
+            if len(tail_lines) > 100:
+                tail_lines = tail_lines[-100:]
+
+            for match in submit_re.finditer(line):
+                job_id = match.group(1)
+                if job_id in seen_job_ids:
+                    continue
+                seen_job_ids.add(job_id)
+                submitted_job_ids.append(job_id)
+
+                error_file, output_file, job_name, is_array = _infer_job_metadata_from_scontrol(job_id)
+                print(f"[jobmon] Detected child job {job_id}; starting monitor...")
+                print(f"[jobmon] Error file: {error_file}")
+                print(f"[jobmon] Output file: {output_file}")
+                daemonize_and_monitor(job_id, error_file, output_file, job_name=job_name, is_array=is_array)
+                time.sleep(0.2)
+
+    return_code = proc.wait()
+    if return_code != 0:
+        print(f"[jobmon] Local submitter failed with exit code {return_code}")
+        _notify_bash_failure(script_path, return_code, tail_lines)
+        sys.exit(return_code)
+
+    if submitted_job_ids:
+        print(f"[jobmon] Local submitter finished successfully.")
+        print(f"[jobmon] Monitors started for child jobs: {', '.join(submitted_job_ids)}")
+        print(f"[jobmon] Check with: jobmon status")
+    else:
+        print("[jobmon] Local submitter finished successfully, but no child jobs were detected.")
 
 
 def cmd_watch(args):
@@ -209,6 +358,11 @@ def main():
     sub = subparsers.add_parser("submit", help="Submit a job and auto-monitor")
     sub.add_argument("sbatch_args", nargs=argparse.REMAINDER, help="Arguments passed to sbatch")
 
+    # bash
+    sub = subparsers.add_parser("bash", help="Run local bash submitter and auto-watch child jobs")
+    sub.add_argument("script_path", help="Path to local bash script")
+    sub.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments passed to the bash script")
+
     # watch
     sub = subparsers.add_parser("watch", help="Monitor an already-submitted job")
     sub.add_argument("job_id", help="SLURM job ID")
@@ -236,6 +390,7 @@ def main():
 
     commands = {
         "submit": cmd_submit,
+        "bash": cmd_bash,
         "watch": cmd_watch,
         "status": cmd_status,
         "cancel": cmd_cancel,
